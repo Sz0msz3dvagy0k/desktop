@@ -436,60 +436,49 @@ void OwncloudPropagator::resetDelayedUploadTasks()
 
 void OwncloudPropagator::adjustDeletedFoldersWithNewChildren(SyncFileItemVector &items)
 {
-    /* 
-       process each item that is new and is a directory and make sure every parent in its tree has the instruction CSYNC_INSTRUCTION_NEW
-       instead of CSYNC_INSTRUCTION_REMOVE
-       NOTE: We are iterating backwards to take advantage of optimization later, when searching for the parent of current it
-    */
-    for (auto it = std::crbegin(items); it != std::crend(items); ++it) {
-        if ((*it)->_instruction != CSYNC_INSTRUCTION_NEW || (*it)->_direction != SyncFileItem::Up || !(*it)->isDirectory() || (*it)->_file == QStringLiteral("/")) {
+    // Views and raw pointers remain valid because this function neither changes paths nor removes items.
+    auto removedDirectories = QHash<QStringView, SyncFileItem *>{};
+    for (const auto &item : std::as_const(items)) {
+        if (item->isDirectory() && item->_instruction == CSYNC_INSTRUCTION_REMOVE && item->_direction == SyncFileItem::Down) {
+            removedDirectories.insert(QStringView{item->_file}, item.data());
+        }
+    }
+
+    if (removedDirectories.isEmpty()) {
+        return;
+    }
+
+    for (const auto &item : std::as_const(items)) {
+        if (!item->isDirectory() || item->_instruction != CSYNC_INSTRUCTION_NEW || item->_direction != SyncFileItem::Up) {
             continue;
         }
 
-        // #1 get root folder name for the current item that we need to reupload
-        const auto folderPathSplit = (*it)->_file.split(QLatin1Char('/'), Qt::SkipEmptyParts);
-        if (folderPathSplit.isEmpty()) {
-            continue;
-        }
-        const auto itemRootFolderName = folderPathSplit.first();
-        if (itemRootFolderName.isEmpty()) {
-            continue;
-        }
-        // #2 iterate backwards (for optimization) and find the root folder by name
-        const auto itemRootFolderReverseIt = std::find_if(it, std::crend(items), [&itemRootFolderName](const auto &currentItem) {
-            return currentItem->_file == itemRootFolderName;
-        });
-
-        if (itemRootFolderReverseIt == std::rend(items)) {
-            continue;
-        }
-
-        // #3 convert reverse iterator to normal iterator
-        const auto itemFolderIt = (itemRootFolderReverseIt + 1).base();
-
-        // #4 if the root folder is set to be removed, then we will need to fix this by reuploading every folder in
-        // the tree, including the root
-        if (itemFolderIt == std::end(items)) {
-            continue;
-        }
-
-        auto nextFolderInTreeIt = itemFolderIt;
-        do {
-            // #5 Iterate forward from the CSYNC_INSTRUCTION_NEW folder's root, and make sure every folder in it's tree is set to CSYNC_INSTRUCTION_NEW
-            if ((*nextFolderInTreeIt)->isDirectory()
-                && (*nextFolderInTreeIt)->_instruction == CSYNC_INSTRUCTION_REMOVE
-                && (*nextFolderInTreeIt)->_direction == SyncFileItem::Down
-                && (*it)->_file.startsWith(QString((*nextFolderInTreeIt)->_file) + QLatin1Char('/'))) {
-
-                qCWarning(lcPropagator) << "WARNING: New directory to upload " << (*it)->_file
-                    << "is in the removed directories tree " << (*nextFolderInTreeIt)->_file
-                    << " This should not happen! But, we are going to reupload the entire folder structure.";
-
-                (*nextFolderInTreeIt)->_instruction = CSYNC_INSTRUCTION_NEW;
-                (*nextFolderInTreeIt)->_direction = SyncFileItem::Up;
+        auto parentPath = QStringView{item->_file};
+        while (true) {
+            const auto slashIndex = parentPath.lastIndexOf(u'/');
+            if (slashIndex <= 0) {
+                break;
             }
-            ++nextFolderInTreeIt;
-        } while (nextFolderInTreeIt != std::end(items) && (*nextFolderInTreeIt)->_file != (*it)->_file);
+            parentPath = parentPath.left(slashIndex);
+
+            const auto removedDirectoryIt = removedDirectories.find(parentPath);
+            if (removedDirectoryIt == removedDirectories.end()) {
+                continue;
+            }
+
+            auto *const removedDirectory = removedDirectoryIt.value();
+            removedDirectories.erase(removedDirectoryIt);
+
+            qCWarning(lcPropagator) << "WARNING: New directory to upload" << item->_file << "is in the removed directories tree" << removedDirectory->_file
+                                    << "This should not happen! But, we are going to reupload the entire folder structure.";
+
+            removedDirectory->_instruction = CSYNC_INSTRUCTION_NEW;
+            removedDirectory->_direction = SyncFileItem::Up;
+
+            if (removedDirectories.isEmpty()) {
+                return;
+            }
+        }
     }
 }
 
