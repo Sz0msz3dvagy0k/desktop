@@ -14,6 +14,7 @@
 #include "syncenginetestutils.h"
 
 #include "caseclashconflictsolver.h"
+#include "clientsideencryption.h"
 #include "configfile.h"
 #include "propagatorjobs.h"
 #include "syncengine.h"
@@ -131,6 +132,79 @@ private Q_SLOTS:
         fakeFolder.syncOnce();
         QVERIFY(itemDidCompleteSuccessfully(completeSpy, "A/a0"));
         QCOMPARE(fakeFolder.currentLocalState(), fakeFolder.currentRemoteState());
+    }
+
+    void testStartupWaitsForAllE2EeUnlockRecoveryJobs()
+    {
+        FakeFolder fakeFolder{FileInfo::A12_B12_C12_S12()};
+
+        auto capabilities = QVariantMap{};
+        capabilities[u"end-to-end-encryption"_s] = QVariantMap{{u"enabled"_s, true}, {u"api-version"_s, u"2.0"_s}};
+        fakeFolder.account()->setCapabilities(capabilities);
+
+        auto certificateFile = QFile{u"e2etestsfakecert.pem"_s};
+        QVERIFY(certificateFile.open(QFile::ReadOnly));
+        const auto certificate = QSslCertificate{certificateFile.readAll()};
+        QVERIFY(!certificate.isNull());
+
+        auto privateKeyFile = QFile{u"e2etestsfakecertprivatekey.pem"_s};
+        QVERIFY(privateKeyFile.open(QFile::ReadOnly));
+        const auto privateKey = privateKeyFile.readAll();
+        QVERIFY(!privateKey.isEmpty());
+
+        fakeFolder.account()->e2e()->setCertificate(certificate);
+        fakeFolder.account()->e2e()->setPrivateKey(privateKey);
+        QVERIFY(QMetaObject::invokeMethod(fakeFolder.account()->e2e(), "setMnemonic", Qt::DirectConnection, Q_ARG(QString, u"test mnemonic"_s)));
+
+        const auto firstFolderId = "first-encrypted-folder-id"_ba;
+        const auto secondFolderId = "second-encrypted-folder-id"_ba;
+        const auto firstRawToken = "first-raw-lock-token"_ba;
+        const auto secondRawToken = "second-raw-lock-token"_ba;
+        const auto firstEncryptedToken = EncryptionHelper::encryptStringAsymmetric(fakeFolder.account()->e2e()->getCertificateInformation(),
+                                                                                   fakeFolder.account()->e2e()->paddingMode(),
+                                                                                   *fakeFolder.account()->e2e(),
+                                                                                   firstRawToken);
+        const auto secondEncryptedToken = EncryptionHelper::encryptStringAsymmetric(fakeFolder.account()->e2e()->getCertificateInformation(),
+                                                                                    fakeFolder.account()->e2e()->paddingMode(),
+                                                                                    *fakeFolder.account()->e2e(),
+                                                                                    secondRawToken);
+        QVERIFY(firstEncryptedToken.has_value());
+        QVERIFY(secondEncryptedToken.has_value());
+        fakeFolder.syncJournal().setE2EeLockedFolder(firstFolderId, *firstEncryptedToken);
+        fakeFolder.syncJournal().setE2EeLockedFolder(secondFolderId, *secondEncryptedToken);
+
+        auto unlockReplies = QList<QPointer<FakePayloadReply>>{};
+        auto nonRecoveryRequestCount = 0;
+        fakeFolder.setServerOverride([&](const QNetworkAccessManager::Operation operation, const QNetworkRequest &request, QIODevice *) -> QNetworkReply * {
+            if (operation == QNetworkAccessManager::DeleteOperation && request.url().path().contains(u"end_to_end_encryption"_s)) {
+                auto reply = new FakePayloadReply(operation, request, {}, 60'000, fakeFolder.networkAccessManager());
+                unlockReplies.append(reply);
+                return reply;
+            }
+
+            ++nonRecoveryRequestCount;
+            return nullptr;
+        });
+
+        QSignalSpy finishedSpy(&fakeFolder.syncEngine(), &SyncEngine::finished);
+        fakeFolder.scheduleSync();
+
+        QTRY_COMPARE(unlockReplies.size(), 2);
+        QCOMPARE(nonRecoveryRequestCount, 0);
+
+        unlockReplies.constFirst()->respond();
+        QTRY_VERIFY(fakeFolder.syncJournal().e2EeLockedFolder(firstFolderId).isEmpty() || fakeFolder.syncJournal().e2EeLockedFolder(secondFolderId).isEmpty());
+        QCOMPARE(nonRecoveryRequestCount, 0);
+
+        unlockReplies.constLast()->respond();
+        QTRY_VERIFY(nonRecoveryRequestCount > 0);
+        if (finishedSpy.isEmpty()) {
+            QVERIFY(finishedSpy.wait());
+        }
+        QVERIFY(finishedSpy.constFirst().constFirst().toBool());
+        QVERIFY(fakeFolder.syncJournal().e2EeLockedFolder(firstFolderId).isEmpty());
+        QVERIFY(fakeFolder.syncJournal().e2EeLockedFolder(secondFolderId).isEmpty());
+        fakeFolder.setServerOverride({});
     }
 
     void testDirDownload() {

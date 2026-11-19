@@ -492,6 +492,10 @@ void OCC::SyncEngine::slotItemDiscovered(const OCC::SyncFileItemPtr &item)
 
 void SyncEngine::startSync()
 {
+    if (_e2EeRecoveryPending) {
+        return;
+    }
+
     if (_journal->exists()) {
         QVector<SyncJournalDb::PollInfo> pollInfos = _journal->getPollInfos();
         if (!pollInfos.isEmpty()) {
@@ -507,30 +511,66 @@ void SyncEngine::startSync()
         const auto e2EeLockedFolders = _journal->e2EeLockedFolders();
 
         if (!e2EeLockedFolders.isEmpty()) {
+            auto locksToRecover = QList<QPair<QByteArray, QByteArray>>{};
             for (const auto &e2EeLockedFolder : e2EeLockedFolders) {
                 const auto folderId = e2EeLockedFolder.first;
-                qCInfo(lcEngine()) << "start unlock job for folderId:" << folderId;
                 const auto folderTokenBase64 = EncryptionHelper::decryptStringAsymmetric(_account->e2e()->getCertificateInformation(),
                                                                                          _account->e2e()->paddingMode(),
                                                                                          *_account->e2e(),
                                                                                          e2EeLockedFolder.second);
                 if (!folderTokenBase64) {
-                    qCWarning(lcEngine()) << "decrypt failed";
-                    return;
+                    qCWarning(lcEngine()) << "Could not decrypt the stored E2EE lock token for folder" << folderId;
+                    continue;
                 }
                 const auto folderToken = QByteArray::fromBase64(*folderTokenBase64);
                 if (folderToken.isEmpty()) {
-                    qCWarning(lcEngine()) << "decrypted folder token is empty";
-                    return;
+                    qCWarning(lcEngine()) << "The stored E2EE lock token is empty for folder" << folderId;
+                    continue;
                 }
-                // TODO: We need to rollback changes done to metadata in case we have an active lock, this needs to be implemented on the server first
-                const auto unlockJob = new OCC::UnlockEncryptFolderApiJob(_account, folderId, folderToken, _journal, this);
-                unlockJob->setShouldRollbackMetadataChanges(true);
-                unlockJob->start();
+                locksToRecover.append({folderId, folderToken});
+            }
+
+            if (!locksToRecover.isEmpty()) {
+                _e2EeRecoveryPending = true;
+                const auto remainingJobs = QSharedPointer<qsizetype>::create(locksToRecover.size());
+                const auto recoveryFinished = [this, remainingJobs] {
+                    --*remainingJobs;
+                    if (*remainingJobs != 0) {
+                        return;
+                    }
+
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this] {
+                            _e2EeRecoveryPending = false;
+                            startSyncAfterE2EeRecovery();
+                        },
+                        Qt::QueuedConnection);
+                };
+
+                for (const auto &[folderId, folderToken] : std::as_const(locksToRecover)) {
+                    qCInfo(lcEngine()) << "start unlock job for folderId:" << folderId;
+                    // TODO: We need to rollback changes done to metadata in case we have an active lock, this needs to be implemented on the server first
+                    const auto unlockJob = new OCC::UnlockEncryptFolderApiJob(_account, folderId, folderToken, _journal, this);
+                    unlockJob->setShouldRollbackMetadataChanges(true);
+                    connect(unlockJob, &UnlockEncryptFolderApiJob::success, this, [recoveryFinished](const QByteArray &) {
+                        recoveryFinished();
+                    });
+                    connect(unlockJob, &UnlockEncryptFolderApiJob::error, this, [recoveryFinished](const QByteArray &, int, const QString &) {
+                        recoveryFinished();
+                    });
+                    unlockJob->start();
+                }
+                return;
             }
         }
     }
 
+    startSyncAfterE2EeRecovery();
+}
+
+void SyncEngine::startSyncAfterE2EeRecovery()
+{
     if (s_anySyncRunning || _syncRunning) {
         return;
     }

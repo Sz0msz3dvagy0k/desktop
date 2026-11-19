@@ -328,11 +328,15 @@ void LockEncryptFolderApiJob::start()
                                                                                  folderTokenEncrypted);
         if (!folderTokenBase64) {
             qCWarning(lcCseJob()) << "decrypt failed";
+            Q_EMIT error(_fileId, 0, tr("Could not decrypt the stored encrypted-folder lock token."));
+            deleteLater();
             return;
         }
         const auto folderToken = QByteArray::fromBase64(*folderTokenBase64);
         if (folderToken.isEmpty()) {
             qCWarning(lcCseJob()) << "decrypted folder token is empty";
+            Q_EMIT error(_fileId, 0, tr("The stored encrypted-folder lock token is empty."));
+            deleteLater();
             return;
         }
         const auto unlockJob = new OCC::UnlockEncryptFolderApiJob(_account, _fileId, folderToken, _journalDb, this);

@@ -239,6 +239,8 @@ private Q_SLOTS:
     void remnantReadOnlyFolderDiscovered(const OCC::SyncFileItemPtr &item);
 
 private:
+    void startSyncAfterE2EeRecovery();
+
     // Some files need a sync run to be executed at a specified time after
     // their status is scheduled to change (e.g. lock status will expire in
     // 20 minutes.)
@@ -326,6 +328,7 @@ private:
     AccountPtr _account;
     bool _needsUpdate = false;
     bool _syncRunning = false;
+    bool _e2EeRecoveryPending = false;
     QString _localPath;
     QString _remotePath;
     QByteArray _remoteRootEtag;

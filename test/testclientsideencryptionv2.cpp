@@ -351,6 +351,36 @@ private Q_SLOTS:
         QCOMPARE(journal.e2EeLockedFolder(folderId), *encryptedToken);
     }
 
+    void testLockRecoveryReportsStoredTokenDecryptionFailure()
+    {
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto invalidEncryptedToken = "not-an-encrypted-lock-token"_ba;
+        SyncJournalDb journal(temporaryDirectory.filePath(u"journal.db"_s));
+        journal.setE2EeLockedFolder(folderId, invalidEncryptedToken);
+
+        auto requestCount = 0;
+        _fakeQnam->setOverride([&requestCount](QNetworkAccessManager::Operation, const QNetworkRequest &, QIODevice *) -> QNetworkReply * {
+            ++requestCount;
+            return nullptr;
+        });
+
+        auto lockJob = new LockEncryptFolderApiJob(_secondAccount, folderId, _secondAccount->e2e()->certificateSha256Fingerprint(), &journal, {}, this);
+        QSignalSpy errorSpy(lockJob, &LockEncryptFolderApiJob::error);
+        lockJob->start();
+
+        _fakeQnam->setOverride({});
+
+        QCOMPARE(errorSpy.count(), 1);
+        QCOMPARE(errorSpy.constFirst().at(0).toByteArray(), folderId);
+        QCOMPARE(errorSpy.constFirst().at(1).toInt(), 0);
+        QVERIFY(!errorSpy.constFirst().at(2).toString().isEmpty());
+        QCOMPARE(requestCount, 0);
+        QCOMPARE(journal.e2EeLockedFolder(folderId), invalidEncryptedToken);
+    }
+
     void testLockRecoveryContinuesWhenServerAlreadyUnlocked()
     {
         QTemporaryDir temporaryDirectory;

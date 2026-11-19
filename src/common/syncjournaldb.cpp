@@ -3023,6 +3023,7 @@ void SyncJournalDb::setE2EeLockedFolder(const QByteArray &folderId, const QByteA
         return;
     }
 
+    // The transaction batches durable per-item state; a server lock token needs its own durability boundary.
     commitInternal(u"Persist E2EE folder lock token"_s);
 }
 
@@ -3099,6 +3100,7 @@ void SyncJournalDb::deleteE2EeLockedFolder(const QByteArray &folderId, const QBy
         return;
     }
 
+    // Persist the unlock before another sync decides whether lock recovery is needed.
     commitInternal(u"Persist E2EE folder unlock"_s);
 }
 

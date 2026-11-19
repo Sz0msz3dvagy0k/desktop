@@ -304,19 +304,31 @@ private Q_SLOTS:
         const auto databasePath = _tempDir.filePath(u"e2ee-lock-token.db"_s);
         const auto folderId = "encrypted-folder-id"_ba;
         const auto encryptedToken = "encrypted-lock-token"_ba;
+        auto recordBeforeLock = SyncJournalFileRecord{};
+        recordBeforeLock._path = "completed-before-lock";
+        recordBeforeLock._modtime = 123456789;
+        auto recordAfterLock = recordBeforeLock;
+        recordAfterLock._path = "uncommitted-after-lock";
 
         {
             SyncJournalDb journal(databasePath);
             QVERIFY(journal.open());
             journal.commit(u"Start E2EE propagation"_s);
+            QVERIFY(journal.setFileRecord(recordBeforeLock));
             journal.setE2EeLockedFolder(folderId, encryptedToken);
             QCOMPARE(journal.e2EeLockedFolder(folderId), encryptedToken);
+            QVERIFY(journal.setFileRecord(recordAfterLock));
 
             journal._db.close();
         }
 
         SyncJournalDb reopenedJournal(databasePath);
         QCOMPARE(reopenedJournal.e2EeLockedFolder(folderId), encryptedToken);
+        auto storedRecord = SyncJournalFileRecord{};
+        QVERIFY(reopenedJournal.getFileRecord(recordBeforeLock._path, &storedRecord));
+        QVERIFY(storedRecord.isValid());
+        QVERIFY(reopenedJournal.getFileRecord(recordAfterLock._path, &storedRecord));
+        QVERIFY(!storedRecord.isValid());
     }
 
     void testE2EeLockTokenDeletionSurvivesAbruptClose()
@@ -338,11 +350,19 @@ private Q_SLOTS:
             journal.deleteE2EeLockedFolder(folderId, encryptedToken);
             QVERIFY(journal.e2EeLockedFolder(folderId).isEmpty());
 
+            auto recordAfterUnlock = SyncJournalFileRecord{};
+            recordAfterUnlock._path = "uncommitted-after-unlock";
+            recordAfterUnlock._modtime = 123456789;
+            QVERIFY(journal.setFileRecord(recordAfterUnlock));
+
             journal._db.close();
         }
 
         SyncJournalDb reopenedJournal(databasePath);
         QVERIFY(reopenedJournal.e2EeLockedFolder(folderId).isEmpty());
+        auto storedRecord = SyncJournalFileRecord{};
+        QVERIFY(reopenedJournal.getFileRecord("uncommitted-after-unlock"_ba, &storedRecord));
+        QVERIFY(!storedRecord.isValid());
     }
 
     void testNumericId()
