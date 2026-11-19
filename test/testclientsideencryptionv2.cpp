@@ -2,12 +2,15 @@
  * SPDX-FileCopyrightText: 2024 Nextcloud GmbH and Nextcloud contributors
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-#include "syncenginetestutils.h"
 #include "clientsideencryption.h"
+#include "clientsideencryptionjobs.h"
+#include "common/syncjournaldb.h"
 #include "foldermetadata.h"
+#include "syncenginetestutils.h"
 #include <QtTest>
 
 using namespace OCC;
+using namespace Qt::StringLiterals;
 
 class TestClientSideEncryptionV2 : public QObject
 {
@@ -85,7 +88,7 @@ private Q_SLOTS:
 
         _secondAccount->e2e()->setCertificate(cert);
         _secondAccount->e2e()->setPrivateKey(privateKey);
-        
+        QVERIFY(QMetaObject::invokeMethod(_secondAccount->e2e(), "setMnemonic", Qt::DirectConnection, Q_ARG(QString, u"test mnemonic"_s)));
     }
 
     void testInitializeNewRootFolderMetadataThenEncryptAndDecrypt()
@@ -218,6 +221,191 @@ private Q_SLOTS:
         QVERIFY(metadataFromJson->metadataSignature().isEmpty());
         QVERIFY(metadataFromJson->binaryMetadataKeyForDecryption().isEmpty());
         QVERIFY(!metadataFromJson->isValid());
+    }
+
+    void testUnlockTokenPersistence_data()
+    {
+        QTest::addColumn<int>("httpStatus");
+        QTest::addColumn<bool>("tokenShouldRemain");
+
+        QTest::newRow("success") << 200 << false;
+        QTest::newRow("already-unlocked") << 404 << false;
+        QTest::newRow("network-error") << 0 << true;
+        QTest::newRow("forbidden") << 403 << true;
+        QTest::newRow("server-error") << 500 << true;
+    }
+
+    void testUnlockTokenPersistence()
+    {
+        QFETCH(int, httpStatus);
+        QFETCH(bool, tokenShouldRemain);
+
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto rawToken = "raw-lock-token"_ba;
+        const auto encryptedToken = "encrypted-lock-token"_ba;
+        SyncJournalDb journal(temporaryDirectory.filePath(u"journal.db"_s));
+        journal.setE2EeLockedFolder(folderId, encryptedToken);
+
+        auto requestSeen = false;
+        _fakeQnam->setOverride(
+            [this, httpStatus, &requestSeen](const QNetworkAccessManager::Operation operation, const QNetworkRequest &request, QIODevice *) -> QNetworkReply * {
+                if (operation != QNetworkAccessManager::DeleteOperation) {
+                    return nullptr;
+                }
+
+                requestSeen = true;
+                if (httpStatus == 200) {
+                    return new FakeJsonReply(operation, request, _fakeQnam.data(), httpStatus);
+                }
+                return new FakeErrorReply(operation, request, _fakeQnam.data(), httpStatus);
+            });
+
+        auto unlockJob = new UnlockEncryptFolderApiJob(_secondAccount, folderId, rawToken, &journal, this);
+        QSignalSpy doneSpy(unlockJob, &UnlockEncryptFolderApiJob::done);
+        unlockJob->start();
+
+        QVERIFY(doneSpy.wait());
+        QVERIFY(requestSeen);
+        QCOMPARE(!journal.e2EeLockedFolder(folderId).isEmpty(), tokenShouldRemain);
+
+        _fakeQnam->setOverride({});
+    }
+
+    void testStaleUnlockDoesNotDeleteNewToken()
+    {
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto oldEncryptedToken = "old-encrypted-lock-token"_ba;
+        const auto newEncryptedToken = "new-encrypted-lock-token"_ba;
+        SyncJournalDb journal(temporaryDirectory.filePath(u"journal.db"_s));
+        journal.setE2EeLockedFolder(folderId, oldEncryptedToken);
+
+        _fakeQnam->setOverride([this](const QNetworkAccessManager::Operation operation, const QNetworkRequest &request, QIODevice *) -> QNetworkReply * {
+            if (operation == QNetworkAccessManager::DeleteOperation) {
+                return new FakeJsonReply(operation, request, _fakeQnam.data(), 200);
+            }
+            return nullptr;
+        });
+
+        auto unlockJob = new UnlockEncryptFolderApiJob(_secondAccount, folderId, "old-raw-lock-token"_ba, &journal, this);
+        QSignalSpy doneSpy(unlockJob, &UnlockEncryptFolderApiJob::done);
+        unlockJob->start();
+        journal.setE2EeLockedFolder(folderId, newEncryptedToken);
+
+        const auto doneReceived = doneSpy.wait();
+        _fakeQnam->setOverride({});
+
+        QVERIFY(doneReceived);
+        QCOMPARE(journal.e2EeLockedFolder(folderId), newEncryptedToken);
+    }
+
+    void testLockRecoveryStopsAfterFailedUnlock()
+    {
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto rawToken = "raw-lock-token"_ba;
+        const auto encryptedToken = EncryptionHelper::encryptStringAsymmetric(_secondAccount->e2e()->getCertificateInformation(),
+                                                                              _secondAccount->e2e()->paddingMode(),
+                                                                              *_secondAccount->e2e(),
+                                                                              rawToken);
+        QVERIFY(encryptedToken.has_value());
+
+        SyncJournalDb journal(temporaryDirectory.filePath(u"journal.db"_s));
+        journal.setE2EeLockedFolder(folderId, *encryptedToken);
+
+        auto deleteRequestCount = 0;
+        auto postRequestCount = 0;
+        auto sentUnlockToken = QByteArray{};
+        _fakeQnam->setOverride([this, &deleteRequestCount, &postRequestCount, &sentUnlockToken](const QNetworkAccessManager::Operation operation,
+                                                                                                const QNetworkRequest &request,
+                                                                                                QIODevice *) -> QNetworkReply * {
+            if (operation == QNetworkAccessManager::DeleteOperation) {
+                ++deleteRequestCount;
+                sentUnlockToken = request.rawHeader("e2e-token");
+                return new FakeErrorReply(operation, request, _fakeQnam.data(), 403);
+            }
+            if (operation == QNetworkAccessManager::PostOperation) {
+                ++postRequestCount;
+            }
+            return nullptr;
+        });
+
+        auto lockJob = new LockEncryptFolderApiJob(_secondAccount, folderId, _secondAccount->e2e()->certificateSha256Fingerprint(), &journal, {}, this);
+        QSignalSpy errorSpy(lockJob, &LockEncryptFolderApiJob::error);
+        lockJob->start();
+
+        const auto errorReceived = errorSpy.wait();
+        _fakeQnam->setOverride({});
+
+        QVERIFY(errorReceived);
+        QCOMPARE(deleteRequestCount, 1);
+        QCOMPARE(postRequestCount, 0);
+        QCOMPARE(sentUnlockToken, rawToken);
+        QCOMPARE(journal.e2EeLockedFolder(folderId), *encryptedToken);
+    }
+
+    void testLockRecoveryContinuesWhenServerAlreadyUnlocked()
+    {
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto oldRawToken = "old-raw-lock-token"_ba;
+        const auto newRawToken = "new-raw-lock-token"_ba;
+        const auto encryptedToken = EncryptionHelper::encryptStringAsymmetric(_secondAccount->e2e()->getCertificateInformation(),
+                                                                              _secondAccount->e2e()->paddingMode(),
+                                                                              *_secondAccount->e2e(),
+                                                                              oldRawToken);
+        QVERIFY(encryptedToken.has_value());
+
+        SyncJournalDb journal(temporaryDirectory.filePath(u"journal.db"_s));
+        journal.setE2EeLockedFolder(folderId, *encryptedToken);
+
+        const auto lockResponse = QJsonDocument::fromJson(R"({"ocs":{"data":{"e2e-token":"new-raw-lock-token"}}})");
+        auto deleteRequestCount = 0;
+        auto postRequestCount = 0;
+        auto sentUnlockToken = QByteArray{};
+        _fakeQnam->setOverride([this, &deleteRequestCount, &postRequestCount, &lockResponse, &sentUnlockToken](const QNetworkAccessManager::Operation operation,
+                                                                                                               const QNetworkRequest &request,
+                                                                                                               QIODevice *) -> QNetworkReply * {
+            if (operation == QNetworkAccessManager::DeleteOperation) {
+                ++deleteRequestCount;
+                sentUnlockToken = request.rawHeader("e2e-token");
+                return new FakeErrorReply(operation, request, _fakeQnam.data(), 404);
+            }
+            if (operation == QNetworkAccessManager::PostOperation) {
+                ++postRequestCount;
+                return new FakeJsonReply(operation, request, _fakeQnam.data(), 200, lockResponse);
+            }
+            return nullptr;
+        });
+
+        auto lockJob = new LockEncryptFolderApiJob(_secondAccount, folderId, _secondAccount->e2e()->certificateSha256Fingerprint(), &journal, {}, this);
+        QSignalSpy successSpy(lockJob, &LockEncryptFolderApiJob::success);
+        lockJob->start();
+
+        const auto successReceived = successSpy.wait();
+        _fakeQnam->setOverride({});
+
+        QVERIFY(successReceived);
+        QCOMPARE(deleteRequestCount, 1);
+        QCOMPARE(postRequestCount, 1);
+        QCOMPARE(sentUnlockToken, oldRawToken);
+        const auto persistedToken = journal.e2EeLockedFolder(folderId);
+        QVERIFY(!persistedToken.isEmpty());
+        const auto decryptedToken = EncryptionHelper::decryptStringAsymmetric(_secondAccount->e2e()->getCertificateInformation(),
+                                                                              _secondAccount->e2e()->paddingMode(),
+                                                                              *_secondAccount->e2e(),
+                                                                              persistedToken);
+        QVERIFY(decryptedToken.has_value());
+        QCOMPARE(QByteArray::fromBase64(*decryptedToken), newRawToken);
     }
 
     void testOriginalFilenameValidation_data()

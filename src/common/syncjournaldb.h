@@ -292,7 +292,7 @@ public:
     void setE2EeLockedFolder(const QByteArray &folderId, const QByteArray &folderToken);
     QByteArray e2EeLockedFolder(const QByteArray &folderId);
     QList<QPair<QByteArray, QByteArray>> e2EeLockedFolders();
-    void deleteE2EeLockedFolder(const QByteArray &folderId);
+    void deleteE2EeLockedFolder(const QByteArray &folderId, const QByteArray &folderToken);
 
     /** Grouping for all functions relating to pin states,
      *

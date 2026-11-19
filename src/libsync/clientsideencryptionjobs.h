@@ -253,6 +253,7 @@ Q_SIGNALS:
 private:
     QByteArray _fileId;
     QByteArray _token;
+    QByteArray _persistedToken;
     QBuffer *_tokenBuf = nullptr;
     QPointer<SyncJournalDb> _journalDb;
     bool _shouldRollbackMetadataChanges = false;

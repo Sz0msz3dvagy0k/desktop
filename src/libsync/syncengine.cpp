@@ -510,13 +510,21 @@ void SyncEngine::startSync()
             for (const auto &e2EeLockedFolder : e2EeLockedFolders) {
                 const auto folderId = e2EeLockedFolder.first;
                 qCInfo(lcEngine()) << "start unlock job for folderId:" << folderId;
-                const auto folderToken = EncryptionHelper::decryptStringAsymmetric(_account->e2e()->getCertificateInformation(), _account->e2e()->paddingMode(), *_account->e2e(), e2EeLockedFolder.second);
-                if (!folderToken) {
+                const auto folderTokenBase64 = EncryptionHelper::decryptStringAsymmetric(_account->e2e()->getCertificateInformation(),
+                                                                                         _account->e2e()->paddingMode(),
+                                                                                         *_account->e2e(),
+                                                                                         e2EeLockedFolder.second);
+                if (!folderTokenBase64) {
                     qCWarning(lcEngine()) << "decrypt failed";
                     return;
                 }
+                const auto folderToken = QByteArray::fromBase64(*folderTokenBase64);
+                if (folderToken.isEmpty()) {
+                    qCWarning(lcEngine()) << "decrypted folder token is empty";
+                    return;
+                }
                 // TODO: We need to rollback changes done to metadata in case we have an active lock, this needs to be implemented on the server first
-                const auto unlockJob = new OCC::UnlockEncryptFolderApiJob(_account, folderId, *folderToken, _journal, this);
+                const auto unlockJob = new OCC::UnlockEncryptFolderApiJob(_account, folderId, folderToken, _journal, this);
                 unlockJob->setShouldRollbackMetadataChanges(true);
                 unlockJob->start();
             }
