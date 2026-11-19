@@ -102,6 +102,36 @@ class TestSyncEngine : public QObject
 {
     Q_OBJECT
 
+private:
+    static bool initializeE2EeAccount(const AccountPtr &account)
+    {
+        auto capabilities = QVariantMap{};
+        capabilities[u"end-to-end-encryption"_s] = QVariantMap{{u"enabled"_s, true}, {u"api-version"_s, u"2.0"_s}};
+        account->setCapabilities(capabilities);
+
+        auto certificateFile = QFile{u"e2etestsfakecert.pem"_s};
+        if (!certificateFile.open(QFile::ReadOnly)) {
+            return false;
+        }
+        const auto certificate = QSslCertificate{certificateFile.readAll()};
+        if (certificate.isNull()) {
+            return false;
+        }
+
+        auto privateKeyFile = QFile{u"e2etestsfakecertprivatekey.pem"_s};
+        if (!privateKeyFile.open(QFile::ReadOnly)) {
+            return false;
+        }
+        const auto privateKey = privateKeyFile.readAll();
+        if (privateKey.isEmpty()) {
+            return false;
+        }
+
+        account->e2e()->setCertificate(certificate);
+        account->e2e()->setPrivateKey(privateKey);
+        return QMetaObject::invokeMethod(account->e2e(), "setMnemonic", Qt::DirectConnection, Q_ARG(QString, u"test mnemonic"_s));
+    }
+
 private Q_SLOTS:
     void initTestCase()
     {
@@ -137,24 +167,7 @@ private Q_SLOTS:
     void testStartupWaitsForAllE2EeUnlockRecoveryJobs()
     {
         FakeFolder fakeFolder{FileInfo::A12_B12_C12_S12()};
-
-        auto capabilities = QVariantMap{};
-        capabilities[u"end-to-end-encryption"_s] = QVariantMap{{u"enabled"_s, true}, {u"api-version"_s, u"2.0"_s}};
-        fakeFolder.account()->setCapabilities(capabilities);
-
-        auto certificateFile = QFile{u"e2etestsfakecert.pem"_s};
-        QVERIFY(certificateFile.open(QFile::ReadOnly));
-        const auto certificate = QSslCertificate{certificateFile.readAll()};
-        QVERIFY(!certificate.isNull());
-
-        auto privateKeyFile = QFile{u"e2etestsfakecertprivatekey.pem"_s};
-        QVERIFY(privateKeyFile.open(QFile::ReadOnly));
-        const auto privateKey = privateKeyFile.readAll();
-        QVERIFY(!privateKey.isEmpty());
-
-        fakeFolder.account()->e2e()->setCertificate(certificate);
-        fakeFolder.account()->e2e()->setPrivateKey(privateKey);
-        QVERIFY(QMetaObject::invokeMethod(fakeFolder.account()->e2e(), "setMnemonic", Qt::DirectConnection, Q_ARG(QString, u"test mnemonic"_s)));
+        QVERIFY(initializeE2EeAccount(fakeFolder.account()));
 
         const auto firstFolderId = "first-encrypted-folder-id"_ba;
         const auto secondFolderId = "second-encrypted-folder-id"_ba;
@@ -204,6 +217,74 @@ private Q_SLOTS:
         QVERIFY(finishedSpy.constFirst().constFirst().toBool());
         QVERIFY(fakeFolder.syncJournal().e2EeLockedFolder(firstFolderId).isEmpty());
         QVERIFY(fakeFolder.syncJournal().e2EeLockedFolder(secondFolderId).isEmpty());
+        fakeFolder.setServerOverride({});
+    }
+
+    void testStartupRetriesE2EeUnlockRecoveryAfterHttpError()
+    {
+        FakeFolder fakeFolder{FileInfo::A12_B12_C12_S12()};
+        QVERIFY(initializeE2EeAccount(fakeFolder.account()));
+
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto rawToken = "raw-lock-token"_ba;
+        const auto encryptedToken = EncryptionHelper::encryptStringAsymmetric(fakeFolder.account()->e2e()->getCertificateInformation(),
+                                                                              fakeFolder.account()->e2e()->paddingMode(),
+                                                                              *fakeFolder.account()->e2e(),
+                                                                              rawToken);
+        QVERIFY(encryptedToken.has_value());
+        fakeFolder.syncJournal().setE2EeLockedFolder(folderId, *encryptedToken);
+
+        auto failedUnlockReply = QPointer<DelayedReply<FakeErrorReply>>{};
+        auto nonRecoveryRequestCount = 0;
+        fakeFolder.setServerOverride([&](const QNetworkAccessManager::Operation operation, const QNetworkRequest &request, QIODevice *) -> QNetworkReply * {
+            if (operation == QNetworkAccessManager::DeleteOperation && request.url().path().contains(u"end_to_end_encryption"_s)) {
+                failedUnlockReply = new DelayedReply<FakeErrorReply>(60'000, operation, request, fakeFolder.networkAccessManager(), 500);
+                return failedUnlockReply;
+            }
+
+            ++nonRecoveryRequestCount;
+            return nullptr;
+        });
+
+        QSignalSpy finishedSpy(&fakeFolder.syncEngine(), &SyncEngine::finished);
+        fakeFolder.scheduleSync();
+
+        QTRY_VERIFY(failedUnlockReply);
+        QCOMPARE(nonRecoveryRequestCount, 0);
+        QCOMPARE(fakeFolder.syncJournal().e2EeLockedFolder(folderId), *encryptedToken);
+
+        failedUnlockReply->FakeErrorReply::respond();
+        QTRY_VERIFY(nonRecoveryRequestCount > 0);
+        if (finishedSpy.isEmpty()) {
+            QVERIFY(finishedSpy.wait());
+        }
+        QVERIFY(finishedSpy.constFirst().constFirst().toBool());
+        QCOMPARE(fakeFolder.syncJournal().e2EeLockedFolder(folderId), *encryptedToken);
+
+        auto successfulUnlockReply = QPointer<FakePayloadReply>{};
+        nonRecoveryRequestCount = 0;
+        finishedSpy.clear();
+        fakeFolder.setServerOverride([&](const QNetworkAccessManager::Operation operation, const QNetworkRequest &request, QIODevice *) -> QNetworkReply * {
+            if (operation == QNetworkAccessManager::DeleteOperation && request.url().path().contains(u"end_to_end_encryption"_s)) {
+                successfulUnlockReply = new FakePayloadReply(operation, request, {}, 60'000, fakeFolder.networkAccessManager());
+                return successfulUnlockReply;
+            }
+
+            ++nonRecoveryRequestCount;
+            return nullptr;
+        });
+
+        fakeFolder.scheduleSync();
+
+        QTRY_VERIFY(successfulUnlockReply);
+        QCOMPARE(nonRecoveryRequestCount, 0);
+        successfulUnlockReply->respond();
+        QTRY_VERIFY(nonRecoveryRequestCount > 0);
+        if (finishedSpy.isEmpty()) {
+            QVERIFY(finishedSpy.wait());
+        }
+        QVERIFY(finishedSpy.constFirst().constFirst().toBool());
+        QVERIFY(fakeFolder.syncJournal().e2EeLockedFolder(folderId).isEmpty());
         fakeFolder.setServerOverride({});
     }
 

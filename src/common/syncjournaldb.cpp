@@ -3023,7 +3023,8 @@ void SyncJournalDb::setE2EeLockedFolder(const QByteArray &folderId, const QByteA
         return;
     }
 
-    // The transaction batches durable per-item state; a server lock token needs its own durability boundary.
+    // Journal transactions batch independently recoverable checkpoints.
+    // The server lock token must survive a crash before propagation starts.
     commitInternal(u"Persist E2EE folder lock token"_s);
 }
 

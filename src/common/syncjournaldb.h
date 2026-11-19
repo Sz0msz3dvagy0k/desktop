@@ -210,8 +210,8 @@ public:
      */
     void forceRemoteDiscoveryNextSync();
 
-    /* Because sqlite transactions are really slow, we encapsulate everything in big transactions
-     * Commit will actually commit the transaction and create a new one.
+    /* Transactions batch independent journal checkpoints for performance; they are not sync-wide atomic boundaries.
+     * commit() persists the current batch and optionally starts a new one.
      */
     void commit(const QString &context, bool startTrans = true);
     void commitIfNeededAndStartNewTransaction(const QString &context);
