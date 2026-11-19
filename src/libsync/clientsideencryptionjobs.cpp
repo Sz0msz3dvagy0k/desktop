@@ -204,14 +204,15 @@ bool UpdateMetadataApiJob::finished()
     return true;
 }
 
-UnlockEncryptFolderApiJob::UnlockEncryptFolderApiJob(const AccountPtr& account,
-                                                     const QByteArray& fileId,
-                                                     const QByteArray& token,
+UnlockEncryptFolderApiJob::UnlockEncryptFolderApiJob(const AccountPtr &account,
+                                                     const QByteArray &fileId,
+                                                     const QByteArray &token,
                                                      SyncJournalDb *journalDb,
-                                                     QObject* parent)
+                                                     QObject *parent)
     : AbstractNetworkJob(account, e2eeBaseUrl(account) + QStringLiteral("lock/") + fileId, parent)
     , _fileId(fileId)
     , _token(token)
+    , _persistedToken(journalDb ? journalDb->e2EeLockedFolder(fileId) : QByteArray{})
     , _journalDb(journalDb)
 {
 }
@@ -234,7 +235,7 @@ void UnlockEncryptFolderApiJob::start()
 
     AbstractNetworkJob::start();
 
-    qCDebug(lcCseJob()) << "unlock folder started for:" << path() << " for fileId: " << _fileId << "token:" << _token;
+    qCDebug(lcCseJob()) << "unlock folder started for:" << path() << " for fileId: " << _fileId;
 }
 
 void UnlockEncryptFolderApiJob::setShouldRollbackMetadataChanges(bool shouldRollbackMetadataChanges)
@@ -253,8 +254,8 @@ bool UnlockEncryptFolderApiJob::finished()
 
     qCDebug(lcCseJob()) << "unlock folder finished with code" << retCode << " for:" << path() << " for fileId: " << _fileId;
 
-    if (retCode != 0) {
-        _journalDb->deleteE2EeLockedFolder(_fileId);
+    if (retCode == 200 || retCode == 404) {
+        _journalDb->deleteE2EeLockedFolder(_fileId, _persistedToken);
     }
 
     Q_EMIT done();
@@ -268,7 +269,6 @@ bool UnlockEncryptFolderApiJob::finished()
     Q_EMIT success(_fileId);
     return true;
 }
-
 
 DeleteMetadataApiJob::DeleteMetadataApiJob(const AccountPtr& account, const QByteArray& fileId, const QByteArray &token, QObject* parent)
     : AbstractNetworkJob(account, e2eeBaseUrl(account) + QStringLiteral("meta-data/") + fileId, parent),
@@ -322,15 +322,30 @@ void LockEncryptFolderApiJob::start()
 
     if (!folderTokenEncrypted.isEmpty()) {
         qCDebug(lcCseJob()) << "lock folder started for:" << path() << " for fileId: " << _fileId << " but we need to first lift the previous lock";
-        const auto folderToken = EncryptionHelper::decryptStringAsymmetric(_account->e2e()->getCertificateInformation(), _account->e2e()->paddingMode(), *_account->e2e(), folderTokenEncrypted);
-        if (!folderToken) {
+        const auto folderTokenBase64 = EncryptionHelper::decryptStringAsymmetric(_account->e2e()->getCertificateInformation(),
+                                                                                 _account->e2e()->paddingMode(),
+                                                                                 *_account->e2e(),
+                                                                                 folderTokenEncrypted);
+        if (!folderTokenBase64) {
             qCWarning(lcCseJob()) << "decrypt failed";
             return;
         }
-        const auto unlockJob = new OCC::UnlockEncryptFolderApiJob(_account, _fileId, *folderToken, _journalDb, this);
+        const auto folderToken = QByteArray::fromBase64(*folderTokenBase64);
+        if (folderToken.isEmpty()) {
+            qCWarning(lcCseJob()) << "decrypted folder token is empty";
+            return;
+        }
+        const auto unlockJob = new OCC::UnlockEncryptFolderApiJob(_account, _fileId, folderToken, _journalDb, this);
         unlockJob->setShouldRollbackMetadataChanges(true);
-        connect(unlockJob, &UnlockEncryptFolderApiJob::done, this, [this]() {
-            this->start();
+        connect(unlockJob, &UnlockEncryptFolderApiJob::success, this, [this]() {
+            start();
+        });
+        connect(unlockJob, &UnlockEncryptFolderApiJob::error, this, [this](const QByteArray &, const int httpErrorCode, const QString &errorMessage) {
+            if (httpErrorCode == 404) {
+                start();
+                return;
+            }
+            Q_EMIT error(_fileId, httpErrorCode, errorMessage);
         });
         unlockJob->start();
         return;

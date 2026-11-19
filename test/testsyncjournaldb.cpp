@@ -299,6 +299,52 @@ private Q_SLOTS:
         QVERIFY(!wipedRecord._valid);
     }
 
+    void testE2EeLockTokenSurvivesAbruptClose()
+    {
+        const auto databasePath = _tempDir.filePath(u"e2ee-lock-token.db"_s);
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto encryptedToken = "encrypted-lock-token"_ba;
+
+        {
+            SyncJournalDb journal(databasePath);
+            QVERIFY(journal.open());
+            journal.commit(u"Start E2EE propagation"_s);
+            journal.setE2EeLockedFolder(folderId, encryptedToken);
+            QCOMPARE(journal.e2EeLockedFolder(folderId), encryptedToken);
+
+            journal._db.close();
+        }
+
+        SyncJournalDb reopenedJournal(databasePath);
+        QCOMPARE(reopenedJournal.e2EeLockedFolder(folderId), encryptedToken);
+    }
+
+    void testE2EeLockTokenDeletionSurvivesAbruptClose()
+    {
+        const auto databasePath = _tempDir.filePath(u"e2ee-lock-token-deletion.db"_s);
+        const auto folderId = "encrypted-folder-id"_ba;
+        const auto encryptedToken = "encrypted-lock-token"_ba;
+
+        {
+            SyncJournalDb journal(databasePath);
+            journal.setE2EeLockedFolder(folderId, encryptedToken);
+            journal.commit(u"Persist initial E2EE lock token"_s);
+        }
+
+        {
+            SyncJournalDb journal(databasePath);
+            QVERIFY(journal.open());
+            journal.commit(u"Start E2EE propagation"_s);
+            journal.deleteE2EeLockedFolder(folderId, encryptedToken);
+            QVERIFY(journal.e2EeLockedFolder(folderId).isEmpty());
+
+            journal._db.close();
+        }
+
+        SyncJournalDb reopenedJournal(databasePath);
+        QVERIFY(reopenedJournal.e2EeLockedFolder(folderId).isEmpty());
+    }
+
     void testNumericId()
     {
         SyncJournalFileRecord record;

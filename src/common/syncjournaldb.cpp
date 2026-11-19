@@ -3020,7 +3020,10 @@ void SyncJournalDb::setE2EeLockedFolder(const QByteArray &folderId, const QByteA
     query->bindValue(2, folderToken);
     if (!query->exec()) {
         qCWarning(lcDb) << "database error:" << query->error();
+        return;
     }
+
+    commitInternal(u"Persist E2EE folder lock token"_s);
 }
 
 QByteArray SyncJournalDb::e2EeLockedFolder(const QByteArray &folderId)
@@ -3075,22 +3078,28 @@ QList<QPair<QByteArray, QByteArray>> SyncJournalDb::e2EeLockedFolders()
     return res;
 }
 
-void SyncJournalDb::deleteE2EeLockedFolder(const QByteArray &folderId)
+void SyncJournalDb::deleteE2EeLockedFolder(const QByteArray &folderId, const QByteArray &folderToken)
 {
     QMutexLocker locker(&_mutex);
     if (!checkConnect()) {
         return;
     }
 
-    const auto query = _queryManager.get(PreparedSqlQueryManager::DeleteE2EeLockedFolderQuery, QByteArrayLiteral("DELETE FROM e2EeLockedFolders WHERE folderId=?1;"), _db);
+    const auto query = _queryManager.get(PreparedSqlQueryManager::DeleteE2EeLockedFolderQuery,
+                                         QByteArrayLiteral("DELETE FROM e2EeLockedFolders WHERE folderId=?1 AND token=?2;"),
+                                         _db);
     if (!query) {
         qCWarning(lcDb) << "database error:" << query->error();
         return;
     }
     query->bindValue(1, folderId);
+    query->bindValue(2, folderToken);
     if (!query->exec()) {
         qCWarning(lcDb) << "database error:" << query->error();
+        return;
     }
+
+    commitInternal(u"Persist E2EE folder unlock"_s);
 }
 
 Optional<PinState> SyncJournalDb::PinStateInterface::rawForPath(const QByteArray &path)
